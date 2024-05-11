@@ -6,6 +6,7 @@ class RequestMessageType(Enum):
   ADD_CLIENT = 3
   VIEW_CONTACTS = 4
   DISCONNECT = 5
+  SEND_WMI_RESULT = 6
   
 class ResponseMessageStatus(Enum):
   OK = 1

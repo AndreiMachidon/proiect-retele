@@ -5,7 +5,6 @@ import os
 
 from util import *
 
-
 class Server:
     def __init__(self):
         self.connected_clients = {}
@@ -13,7 +12,9 @@ class Server:
         self.host = '172.28.208.1'
         self.port = 3333
         self.initialise_ssl_credentials()
-        
+        self.command_id = 0
+        self.command_results = {}
+
     def initialise_ssl_credentials(self):
         current_dir = os.path.dirname(os.path.abspath(__file__))
         certfile_path = os.path.join(current_dir, 'ssl_certificate/certificate.crt')  
@@ -32,15 +33,19 @@ class Server:
                     response = self.connect_client(request, client_socket)
                     client_socket.sendall(response)
                     self.send_current_clients_list_to_new_connected_client(client_socket)
-                if request.type == RequestMessageType.ADD_CLIENT:
+                elif request.type == RequestMessageType.ADD_CLIENT:
                     response = self.add_contact(request, client_socket)
                     client_socket.sendall(response)
                 elif request.type == RequestMessageType.VIEW_CONTACTS:
                     response = self.send_contacts_list(client_socket)
                     client_socket.sendall(response)
+                elif request.type == RequestMessageType.SEND_WMI_COMMAND:
+                    self.send_wmi_command(request, client_socket)
+                elif request.type == RequestMessageType.SEND_WMI_RESULT:
+                    self.handle_wmi_result(request, client_socket)
                 elif request.type == RequestMessageType.DISCONNECT:
-                    self.disconnect_client(client_socket)  
-                    return     
+                    self.disconnect_client(client_socket)
+                    return
         except Exception as e:
             self.disconnect_client(client_socket)
             return
@@ -99,6 +104,7 @@ class Server:
             if info['socket'] == client_socket:
                 return client_name
         return None
+        
                 
     def notify_clients(self, message, current_client):
         msg = serialize(Response(ResponseMessageStatus.OK, message))
@@ -108,6 +114,46 @@ class Server:
                     info['socket'].send(msg)
                 except Exception as e:
                     print(f"Error notifying client {client_name}: {e}")
+                    
+    def send_wmi_command(self, request, client_socket):
+        command_id = str(self.command_id)
+        self.command_id += 1
+        command_info = {'initiator_socket': client_socket, 'receivers': [], 'result': []}
+        self.command_results[command_id] = command_info 
+
+        target_clients = request.params[0].split(',')
+        wmi_command = ' '.join(request.params[1:])
+        results = {}
+
+        with self.lock:
+            for client_name in target_clients:
+                if client_name in self.connected_clients:
+                    self.command_results[command_id]['receivers'].append(client_name)
+                    try:
+                        client_info = self.connected_clients[client_name]
+                        client_info['socket'].send(serialize(Request(RequestMessageType.SEND_WMI_COMMAND, [command_id, wmi_command])))
+                    except Exception as e:
+                        results[client_name] = f"Failed to send command: {e}"
+                else:
+                    results[client_name] = "Client not found"
+    
+        if not self.command_results[command_id]:
+            self.send_results_back(client_socket, command_id)
+        
+    def handle_wmi_result(self, request, client_socket):
+        command_id = request.params[0]
+        result = ' '.join(request.params[1:])
+        if command_id in self.command_results:
+            self.command_results[command_id]['result'].append(result)
+            if len(self.command_results[command_id]['result']) == len(self.command_results[command_id]['receivers']):
+                self.send_results_back(command_id)
+
+    def send_results_back(self, command_id):
+        results = self.command_results[command_id]['result']
+        formatted_results = "\n".join(results)
+        response = serialize(Response(ResponseMessageStatus.OK, formatted_results))
+        client_socket = self.command_results[command_id]['initiator_socket']
+        client_socket.sendall(response)
                     
     def disconnect_client(self, client_socket):
         with self.lock:
