@@ -58,7 +58,7 @@ class Server:
         with self.lock:
             self.connected_clients[client_name] = client_info
             self.notify_clients(f"Hey, see that {client_name} has connected from {client_ip}. Type 'add {client_name}' to add them to your list.", current_client=client_name)
-        return serialize(Response(ResponseMessageStatus.OK, f"Welcome {client_name} from {client_ip}!"))
+        return serialize(Response(ResponseMessageStatus.OK, f"Welcome {client_name}! Your IP is: {client_ip}."))
 
     def send_current_clients_list_to_new_connected_client(self, client_socket):
         current_client_name = self.reverse_lookup(client_socket)
@@ -83,8 +83,14 @@ class Server:
         if target_client_name in self.connected_clients:
             current_client_info = self.connected_clients[current_client_name]
             target_client_info = self.connected_clients[target_client_name]
-            current_client_info['contacts'].append((target_client_name, target_client_info['address']))
-            response = serialize(Response(ResponseMessageStatus.OK, f"{target_client_name} added to your list."))
+            if target_client_name == current_client_name:
+                response = serialize(Response(ResponseMessageStatus.ERROR, "You cannot add yourself to your list."))
+            else:
+                if target_client_name not in [name for name, _ in current_client_info['contacts']]:
+                    current_client_info['contacts'].append((target_client_name, target_client_info['address']))
+                    response = serialize(Response(ResponseMessageStatus.OK, f"{target_client_name} added to your list."))
+                else:
+                    response = serialize(Response(ResponseMessageStatus.ERROR, f"{target_client_name} is already in your list."))
         else:
             response = serialize(Response(ResponseMessageStatus.ERROR, "Client name not found."))
         return response
@@ -94,9 +100,9 @@ class Server:
         contacts = self.connected_clients[current_client_name]['contacts']
         if contacts:
             formatted_contacts = "\n".join([f"{index + 1}. {name} -> IP: {ip}" for index, (name, ip) in enumerate(contacts)])
-            message = f"Clients you are connected to:\n{formatted_contacts}"
+            message = f"Machines you are connected to:\n{formatted_contacts}"
         else:
-            message = "You have no connected clients in your list."
+            message = "You have no connected machines in your list."
         return serialize(Response(ResponseMessageStatus.OK, message))
         
     def reverse_lookup(self, client_socket):
@@ -124,14 +130,28 @@ class Server:
         target_clients = request.params[0].split(',')
         wmi_command = ' '.join(request.params[1:])
         results = {}
+        
+        initiator_name = self.reverse_lookup(client_socket)
 
-        with self.lock:
+        with self.lock:     
+            are_all_clients_connected = self.are_all_clients_connected(target_clients)
+            if not are_all_clients_connected:
+                response = serialize(Response(ResponseMessageStatus.ERROR, "You are trying to send a command to a machine that is not connected to the server."))
+                client_socket.sendall(response)
+                return
+            
+            are_all_clients_in_list = self.are_all_machines_in_your_list(target_clients, initiator_name)
+            if not are_all_clients_in_list:
+                response = serialize(Response(ResponseMessageStatus.ERROR, "You are trying to send a command to a machine that is not in your list."))
+                client_socket.sendall(response)
+                return
+            
             for client_name in target_clients:
                 if client_name in self.connected_clients:
                     self.command_results[command_id]['receivers'].append(client_name)
                     try:
                         client_info = self.connected_clients[client_name]
-                        client_info['socket'].send(serialize(Request(RequestMessageType.SEND_WMI_COMMAND, [command_id, wmi_command])))
+                        client_info['socket'].send(serialize(Request(RequestMessageType.SEND_WMI_COMMAND, [command_id, initiator_name, wmi_command])))
                     except Exception as e:
                         results[client_name] = f"Failed to send command: {e}"
                 else:
@@ -139,10 +159,23 @@ class Server:
     
         if not self.command_results[command_id]:
             self.send_results_back(client_socket, command_id)
+            
+    def are_all_machines_in_your_list(self, target_clients, current_client_name):
+        for client_name in target_clients:
+            if client_name not in [name for name, _ in self.connected_clients[current_client_name]['contacts']]:
+                return False
+        return True
+    
+    def are_all_clients_connected(self, target_clients):
+        for client_name in target_clients:
+            if client_name not in self.connected_clients.keys():
+                return False
+        return True
         
     def handle_wmi_result(self, request, client_socket):
         command_id = request.params[0]
-        result = ' '.join(request.params[1:])
+        client_name = self.reverse_lookup(client_socket)
+        result = f"\n{'-'*20}\nRESULTS FOR MACHINE {client_name}:\n{'-'*20}\n" + ' '.join(request.params[1:])
         if command_id in self.command_results:
             self.command_results[command_id]['result'].append(result)
             if len(self.command_results[command_id]['result']) == len(self.command_results[command_id]['receivers']):
@@ -150,7 +183,7 @@ class Server:
 
     def send_results_back(self, command_id):
         results = self.command_results[command_id]['result']
-        formatted_results = "\n".join(results)
+        formatted_results = f"\n{'='*40}\nRESULTS FOR THE WMI COMMAND:\n{'='*40}\n" + "\n".join(results) + "\n" + f"{'='*40}"
         response = serialize(Response(ResponseMessageStatus.OK, formatted_results))
         client_socket = self.command_results[command_id]['initiator_socket']
         client_socket.sendall(response)
@@ -160,6 +193,7 @@ class Server:
             client_name = self.reverse_lookup(client_socket)
             if client_name:
                 del self.connected_clients[client_name]
+                client_socket.shutdown(socket.SHUT_RDWR)
                 client_socket.close()
                 self.notify_clients(f"{client_name} has disconnected. If you had him in your list, it is now removed.", current_client=None)
                 for name, info in self.connected_clients.items():
